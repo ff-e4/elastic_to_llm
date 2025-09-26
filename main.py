@@ -201,13 +201,18 @@ def _parse_jsonl(text):
     return out
 
 SYSTEM_PROMPT = (
-    "You are an incident analyst. For EACH input record, output exactly ONE JSON line with keys "
-    "{id, anomaly, score, reason, tags}. "
-    "anomaly: boolean (true only if security relevant), score: 0..1, "
-    "reason: SHORT & ACTIONABLE citing indicators (ip, path, query, status, method, ua). "
-    "tags: array of short labels like ['SQLi','Traversal','Bruteforce','5xx','AuthFail','Recon','SuspPath']. "
-    "Non-security events like 301/302 or ordinary 200 responses are NOT anomalies unless combined with another indicator. "
-    "Output JSONL only. No prose."
+    # More verbose explanation of each find:
+    "You are a incident analyst. Describe the anomaly, score, and reason"
+    "Non-security events like 301/302 or ordinary 200 responses are NOT anomalies unless combined with another indicator."
+    "write a paragraph explaining what is happening and why."
+    ## If you want minimal output in json format, use this style:
+    # "You are an incident analyst. For EACH input record, output exactly ONE JSON line with keys "
+    # "{id, anomaly, score, reason, tags}. "
+    # "anomaly: boolean (true only if security relevant), score: 0..1, "
+    # "reason: SHORT & ACTIONABLE citing indicators (ip, path, query, status, method, ua). "
+    # "tags: array of short labels like ['SQLi','Traversal','Bruteforce','5xx','AuthFail','Recon','SuspPath']. "
+    # "Non-security events like 301/302 or ordinary 200 responses are NOT anomalies unless combined with another indicator. "
+    # "Output JSONL only. No prose."
 )
 
 def call_lm_studio(records):
