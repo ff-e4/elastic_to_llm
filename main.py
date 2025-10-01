@@ -8,23 +8,28 @@ from urllib.parse import quote
 from elasticsearch import Elasticsearch
 
 # =========================
-# Config (env overrides)  |
+# Config (env overrides)
 # =========================
-ES_URL    = os.getenv("ES_URL", "CHANGEME:9200")
+ES_URL    = os.getenv("ES_URL", "http://CHANGEME:9200")
 ES_USER   = os.getenv("ES_USER", "CHANGEME")
 ES_PASS   = os.getenv("ES_PASS", "CHANGEME")
-ES_INDEX  = os.getenv("ES_INDEX", "logs-*")   # index or pattern
+ES_INDEX  = os.getenv("ES_INDEX", "filebeat-*")   # index or pattern
 TIME_RANGE = os.getenv("TIME_RANGE", "now-1h")
 
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "200"))     # ES docs per page
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))    # docs per LM Studio call
 
 LM_BASE_URL = os.getenv("LM_BASE_URL", "http://localhost:1234")
-LM_MODEL    = os.getenv("LM_MODEL", "PUT-MODEL-ID-HERE") # i.e. meta-llama-3.1-8b-instruct
+LM_MODEL    = os.getenv("LM_MODEL", "meta-llama-3.1-8b-instruct")
 LM_MAX_TOKENS = int(os.getenv("LM_MAX_TOKENS", "256"))
 LM_TEMPERATURE = float(os.getenv("LM_TEMPERATURE", "0.1"))
 
 OUT_PATH = os.getenv("OUT_PATH", "anomalies.jsonl")
+
+VERBOSE_ENABLED = os.getenv("VERBOSE_ENABLED", "1") == "1"
+OUT_VERBOSE_PATH = os.getenv("OUT_VERBOSE_PATH", "anomalies_verbose.txt")
+EXPLAIN_MAX_TOKENS = int(os.getenv("EXPLAIN_MAX_TOKENS", "2000"))
+
 
 # Optional: set to your Kibana Discover base (e.g., "https://kibana.example.com/app/discover#/")
 KIBANA_BASE = os.getenv("KIBANA_BASE")
@@ -110,7 +115,7 @@ def compact(hit):
     return out
 
 # =========================
-# Prefilter (Step 2)
+# Prefilter (Step 2) - Use BYPASS_FILTER=1 on command line if too many results are lost
 # =========================
 SUSP_PATHS = re.compile(r"(\.\./|%2e%2e|/\.git|/wp-admin|/wp-login|/phpmyadmin|/etc/passwd|/admin|/shell|/id_rsa)", re.I)
 SUSP_QUERY = re.compile(r"(union\s+select|sleep\(|benchmark\(|\bconcat\(|\bload_file\(|\boutfile\b|<script|%3cscript)", re.I)
@@ -201,18 +206,16 @@ def _parse_jsonl(text):
     return out
 
 SYSTEM_PROMPT = (
-    # More verbose explanation of each find:
-    "You are a incident analyst. Describe the anomaly, score, and reason"
-    "Non-security events like 301/302 or ordinary 200 responses are NOT anomalies unless combined with another indicator."
-    "write a paragraph explaining what is happening and why."
-    ## If you want minimal output in json format, use this style:
-    # "You are an incident analyst. For EACH input record, output exactly ONE JSON line with keys "
-    # "{id, anomaly, score, reason, tags}. "
-    # "anomaly: boolean (true only if security relevant), score: 0..1, "
-    # "reason: SHORT & ACTIONABLE citing indicators (ip, path, query, status, method, ua). "
-    # "tags: array of short labels like ['SQLi','Traversal','Bruteforce','5xx','AuthFail','Recon','SuspPath']. "
-    # "Non-security events like 301/302 or ordinary 200 responses are NOT anomalies unless combined with another indicator. "
-    # "Output JSONL only. No prose."
+    # "You are a incident analyst. Describe the anomaly, score, and reason"
+    # "Non-security events like 301/302 or ordinary 200 responses are NOT anomalies unless combined with another indicator."
+    # "write a paragraph explaining what is happening and why."
+    "You are an incident analyst. For EACH input record, output exactly ONE JSON line with keys "
+    "{id, anomaly, score, reason, tags}. "
+    "anomaly: boolean (true only if security relevant), score: 0..1, "
+    "reason: SHORT & ACTIONABLE citing indicators (ip, path, query, status, method, ua). "
+    "tags: array of short labels like ['SQLi','Traversal','Bruteforce','5xx','AuthFail','Recon','SuspPath']. "
+    "Non-security events like 301/302 or ordinary 200 responses are NOT anomalies unless combined with another indicator. "
+    "Output JSONL only. No prose."
 )
 
 def call_lm_studio(records):
@@ -279,6 +282,72 @@ def call_lm_studio(records):
     if "error" in data2:
         raise RuntimeError(f"LM completions error: {data2['error']}")
     raise RuntimeError(f"LM unexpected response: {json.dumps(data2)[:500]}")
+
+# added verbosity option
+def call_lm_explain(item):
+    """
+    Ask for a single verbose explanation for ONE record.
+    We keep it single-record to avoid context/output truncation.
+    """
+    # Build a compact, self-contained record for the prompt
+    rec = {
+        "id": item.get("_id"),
+        "timestamp": item.get("ts") or item.get("@timestamp"),
+        "ip": item.get("ip") or item.get("client.ip") or item.get("source.ip") or item.get("source.address") or item.get("client.address"),
+        "method": item.get("method") or item.get("http.request.method"),
+        "status": item.get("status") or item.get("http.response.status_code"),
+        "path": item.get("path") or item.get("url.path") or item.get("url.original"),
+        "query": item.get("query") or item.get("url.query"),
+        "ua": item.get("ua") or item.get("user_agent.original"),
+        "referrer": item.get("ref") or item.get("referrer"),
+        "user": item.get("user.name"),
+        "host": item.get("host.name"),
+        "message": (item.get("message") or "")[:800],  # cap input size just in case
+    }
+
+    # Your preferred prose prompt (kept concise and directive)
+    sys_prompt = (
+        "You are an incident analyst. Non-security events like 301/302 or ordinary 200 responses "
+        "are NOT anomalies unless combined with another indicator."
+        "Identify attack vectors, such as: SQLi, XSS, directory traversal and report them with context"
+        "User agents of Chrome/[Version], like Chrome/140.0.0.0 and Chrome/139.0.0.0 are correct and NOT anomalies"
+        "Mobile user agents, such as iPhone are NOT anomalies"
+        "User agents GPTbot and Baiduspider are suspicious and should be reported as a threat"
+    )
+    user_prompt = (
+        "Describe the anomaly, score, and reason in a single clear paragraph (keep it under ~180 words). "
+        "Explain what is happening and why, referencing concrete indicators (IP, path, query, status, method, UA, time). "
+        "Input record:\n" + json.dumps(rec, ensure_ascii=False)
+    )
+
+    # Prefer chat. Single-record ⇒ no output truncation with EXPLAIN_MAX_TOKENS
+    payload = {
+        "model": LM_MODEL,
+        "temperature": LM_TEMPERATURE,
+        "max_tokens": EXPLAIN_MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "stream": False
+    }
+    r = requests.post(f"{LM_BASE_URL}/v1/chat/completions", json=payload, timeout=60)
+    if r.status_code >= 400:
+        # Fallback to completions if needed
+        comp = {
+            "model": LM_MODEL,
+            "prompt": sys_prompt + "\n\n" + user_prompt,
+            "temperature": LM_TEMPERATURE,
+            "max_tokens": EXPLAIN_MAX_TOKENS,
+            "stream": False
+        }
+        r2 = requests.post(f"{LM_BASE_URL}/v1/completions", json=comp, timeout=60)
+        r2.raise_for_status()
+        data2 = r2.json()
+        return (data2.get("choices",[{}])[0].get("text","") or "").strip()
+    data = r.json()
+    return (data.get("choices",[{}])[0].get("message",{}).get("content","") or "").strip()
+
 
 # =========================
 # Output helpers (Step 4)
@@ -360,6 +429,38 @@ def write_results(batch, results, out_f):
         out_f.write(json.dumps(enriched, ensure_ascii=False) + "\n")
     out_f.flush()
 
+def write_verbose(item, verdict, out_txt_f):
+    """
+    item: the enriched/normalized record (same object you passed to the classifier)
+    verdict: dict with anomaly/score/reason/tags (from classifier)
+    """
+    # Build handy pivots for the header
+    ts = item.get("ts") or item.get("@timestamp") or "-"
+    ip = item.get("ip") or item.get("client.ip") or item.get("source.ip") or item.get("client.address") or "-"
+    method = item.get("method") or item.get("http.request.method") or "-"
+    status = item.get("status") or item.get("http.response.status_code") or "-"
+    path = item.get("path") or item.get("url.path") or "-"
+    query = item.get("query") or item.get("url.query") or ""
+    urlish = path + (("?" + query) if query else "")
+    score = verdict.get("score")
+    reason = verdict.get("reason")
+
+    # Ask the explainer for a paragraph
+    paragraph = call_lm_explain(item)
+
+    out_txt_f.write(f"ID: {item.get('_id')}\n")
+    out_txt_f.write(f"Time: {ts}\n")
+    out_txt_f.write(f"IP: {ip}\n")
+    out_txt_f.write(f"Request: {method} {urlish} → {status}\n")
+    out_txt_f.write(f"Score: {score}\n")
+    if reason:
+        out_txt_f.write(f"Reason (concise): {reason}\n")
+    out_txt_f.write("Explanation:\n")
+    out_txt_f.write(paragraph.strip() + "\n")
+    out_txt_f.write("-" * 80 + "\n")
+    out_txt_f.flush()
+
+
 # =========================
 # Main
 # =========================
@@ -390,6 +491,19 @@ def main():
                 try:
                     results = call_lm_studio(batch)
                     write_results(batch, results, out_f)
+
+                    # Verbose pass (per anomaly) — only if enabled
+                    if VERBOSE_ENABLED:
+                        by_id = {r.get("id"): r for r in results}
+                        # open once per page to avoid reopening constantly
+                        if 'out_txt_f' not in locals():
+                            out_txt_f = open(OUT_VERBOSE_PATH, "a", encoding="utf-8")
+                        for item in batch:
+                            rid = item["_id"]
+                            verdict = by_id.get(rid) or {}
+                            if verdict.get("anomaly") is True:
+                                write_verbose(item, verdict, out_txt_f)
+
                 except Exception as e:
                     print(f"[!] LLM call failed: {e}", file=sys.stderr)
                 batch = []
